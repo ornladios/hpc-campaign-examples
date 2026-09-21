@@ -390,6 +390,14 @@ derivations identify every field used for geometry, color, or contours. The
 scalar-field script follows the same pattern, but sequence items are
 `SCALAR_FIELD` datasets rather than PNG images.
 
+Each invocation also creates one configured workflow Plan shared by all of its
+Visualization Activities. The Plan records the dataset and variable selection,
+step selection, rendering or storage parameters, and replacement policy. Its
+location is an immutable GitHub script URL when the local script matches a
+commit known through `origin`; otherwise it is the embedded campaign-local
+script path. Derived-variable and statistics processing use the same workflow
+Plan convention.
+
 ## Run the tests
 
 ```bash

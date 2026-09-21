@@ -1231,6 +1231,29 @@ def main() -> int:
         print(f"[info] datasets : {len(datasets)}")
         print(f"[info] variables: {'<all>' if args.allVariables else variables}")
         print(f"[info] visType  : {normalize_vis_type(args.visType)}")
+        workflow_details = {
+            "selection": {
+                "datasets": [dataset.name for dataset in datasets],
+                "dataset_patterns": patterns,
+                "requested_datasets": exact_names,
+                "variables": "all" if args.allVariables else variables,
+                "steps": "all" if args.allSteps else {"index": args.step},
+            },
+            "parameters": {
+                "visualization_type": normalize_vis_type(args.visType),
+                "sequential_colormap": args.cmap,
+                "diverging_colormap": args.divergingCmap,
+                "contour_levels": args.contourLevels,
+                "contour_line_width": args.contourLineWidth,
+                "dpi": args.dpi,
+                "figure_size_inches": [args.figureWidth, args.figureHeight],
+                "thumbnail_index": args.thumbnailStep,
+            },
+            "output_policy": {
+                "external_images": bool(args.externalImages),
+                "replace": bool(args.replace),
+            },
+        }
 
         directory_map = build_directory_map(info_data)
         for dataset in datasets:
@@ -1314,7 +1337,11 @@ def main() -> int:
                 else:
                     print(f"[ok] added visualization visid={visid} name={sequence_name} images={len(images)}")
                 if provenance_recorder is None:
-                    provenance_recorder = VisualizationProvenanceRecorder(manager, Path(__file__))
+                    provenance_recorder = VisualizationProvenanceRecorder(
+                        manager,
+                        Path(__file__),
+                        workflow_details=workflow_details,
+                    )
                 provenance_output = provenance_recorder.record(
                     source_dataset=dataset.name,
                     sequence_name=sequence_name,

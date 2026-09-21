@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -141,6 +142,15 @@ class LogicalProduct:
     coordinate_system: str | None
 
 
+@dataclass(frozen=True)
+class WorkflowPlan:
+    """One configured workflow Plan and its embedded implementation."""
+
+    reference: QualifiedName
+    script_dataset: str
+    location: str
+
+
 @dataclass
 class ProvenanceIndex:
     """References created while ingesting one campaign."""
@@ -218,6 +228,98 @@ def _store_plan_source(manager: Manager, source: Path, logical_name: str) -> str
     """Embed a small plan file and return its campaign-local location."""
     manager.text(source, name=logical_name, store=True)
     return logical_name
+
+
+def _git_output(directory: Path, *arguments: str) -> str | None:
+    """Run a read-only Git query in directory, returning stripped stdout."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _github_repository_url(remote: str) -> str | None:
+    """Normalize common GitHub remote spellings to an HTTPS repository URL."""
+    value = remote.strip()
+    match = re.fullmatch(r"https?://github\.com/(?P<path>[^\s]+?)(?:\.git)?/?", value)
+    if match is None:
+        match = re.fullmatch(r"git@github\.com:(?P<path>[^\s]+?)(?:\.git)?", value)
+    if match is None:
+        match = re.fullmatch(r"ssh://git@github\.com/(?P<path>[^\s]+?)(?:\.git)?/?", value)
+    if match is None:
+        return None
+    return f"https://github.com/{match.group('path')}"
+
+
+def github_script_location(source: Path) -> str | None:
+    """Return an immutable GitHub URL when source matches a known origin commit."""
+    resolved = source.expanduser().resolve()
+    root_text = _git_output(resolved.parent, "rev-parse", "--show-toplevel")
+    if root_text is None:
+        return None
+    root = Path(root_text).resolve()
+    try:
+        relative = resolved.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+    if _git_output(root, "ls-files", "--error-unmatch", "--", relative) is None:
+        return None
+    if _git_output(root, "diff", "--name-only", "HEAD", "--", relative) is not None:
+        return None
+
+    remote = _git_output(root, "remote", "get-url", "origin")
+    commit = _git_output(root, "rev-parse", "HEAD")
+    remote_refs = _git_output(
+        root,
+        "for-each-ref",
+        "--contains",
+        "HEAD",
+        "--format=%(refname:short)",
+        "refs/remotes/origin",
+    )
+    if remote is None or commit is None or remote_refs is None:
+        return None
+    repository = _github_repository_url(remote)
+    if repository is None:
+        return None
+    return f"{repository}/blob/{commit}/{relative}"
+
+
+def add_workflow_plan(
+    manager: Manager,
+    *,
+    name: str,
+    workflow: str,
+    script_path: Path,
+    details: dict[str, Any],
+) -> WorkflowPlan:
+    """Create one configured workflow Plan with a resolvable script reference."""
+    resolved_script = script_path.expanduser().resolve()
+    script_dataset = _store_plan_source(
+        manager,
+        resolved_script,
+        f"plans/{resolved_script.name}",
+    )
+    location = github_script_location(resolved_script) or script_dataset
+    payload = {
+        "schema_version": 1,
+        "workflow": workflow,
+        "implementation_dataset": script_dataset,
+        **details,
+    }
+    value = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    reference = manager.add_plan(name, location=location, value=value)
+    return WorkflowPlan(reference, script_dataset, location)
 
 
 def _store_json(manager: Manager, logical_name: str, payload: dict[str, Any]) -> None:
@@ -450,12 +552,19 @@ def record_campaign_provenance(
     if derived_paths:
         assert analysis_agent is not None
         script = Path(__file__).with_name("adios_derived_variables.py")
-        # The script is one reusable Plan. Run-specific parameters belong on
-        # the simulation Plans and operation-specific values belong in each
-        # Activity's action specification; duplicating the script per run
-        # would add metadata without changing its identity or meaning.
-        plan_location = _store_plan_source(manager, script, "plans/adios_derived_variables.py")
-        plan = manager.add_plan("MHD derived-variable calculation", location=plan_location)
+        workflow_plan = add_workflow_plan(
+            manager,
+            name="MHD derived-variable workflow",
+            workflow="derived_variables",
+            script_path=script,
+            details={
+                "selection": {"datasets": sorted(derived_paths)},
+                "parameters": {
+                    "discretization": "numpy.gradient with unit grid spacing",
+                    "products": sorted(DERIVED_PRODUCTS),
+                },
+            },
+        )
         for name, path in sorted(derived_paths.items()):
             run_name = run_name_from_dataset(name, resolved_root)
             _register_derived_variables(
@@ -466,15 +575,26 @@ def record_campaign_provenance(
                 name,
                 path,
                 analysis_agent,
-                plan,
-                plan_location,
+                workflow_plan.reference,
+                workflow_plan.script_dataset,
             )
 
     if stats_paths:
         assert analysis_agent is not None
         script = Path(__file__).with_name("adios_stats.py")
-        plan_location = _store_plan_source(manager, script, "plans/adios_stats.py")
-        plan = manager.add_plan("MHD descriptive-statistics calculation", location=plan_location)
+        workflow_plan = add_workflow_plan(
+            manager,
+            name="MHD descriptive-statistics workflow",
+            workflow="descriptive_statistics",
+            script_path=script,
+            details={
+                "selection": {"datasets": sorted(stats_paths)},
+                "parameters": {
+                    "scope": "all elements per output timestep",
+                    "statistics": list(STAT_NAMES),
+                },
+            },
+        )
         for name, path in sorted(stats_paths.items()):
             run_name = run_name_from_dataset(name, resolved_root)
             _register_statistics(
@@ -485,8 +605,8 @@ def record_campaign_provenance(
                 name,
                 path,
                 analysis_agent,
-                plan,
-                plan_location,
+                workflow_plan.reference,
+                workflow_plan.script_dataset,
             )
 
     return index
@@ -598,9 +718,18 @@ def _visualization_definition(records: dict[str, ProvEntity], vis_type: str) -> 
 class VisualizationProvenanceRecorder:
     """Append visualization Activities after image sequences are registered."""
 
-    def __init__(self, manager: Manager, script_path: Path):
+    def __init__(
+        self,
+        manager: Manager,
+        script_path: Path,
+        *,
+        workflow: str = "render_visualizations",
+        workflow_details: dict[str, Any] | None = None,
+    ):
         self.manager = manager
         self.script_path = script_path.resolve()
+        self.workflow = workflow
+        self.workflow_details = dict(workflow_details or {})
         self.agent = manager.add_agent(
             "software",
             "Matplotlib",
@@ -609,16 +738,21 @@ class VisualizationProvenanceRecorder:
         self.plan: tuple[QualifiedName, str] | None = None
 
     def _plan(self) -> tuple[QualifiedName, str]:
-        """Return the one reusable rendering Plan shared by all runs."""
+        """Return the configured workflow Plan shared by this invocation."""
         if self.plan is not None:
             return self.plan
-        location = _store_plan_source(
+        labels = {
+            "render_visualizations": "MHD visualization workflow",
+            "store_scalar_fields": "MHD scalar-field visualization workflow",
+        }
+        workflow_plan = add_workflow_plan(
             self.manager,
-            self.script_path,
-            f"plans/{self.script_path.name}",
+            name=labels.get(self.workflow, f"MHD {self.workflow} workflow"),
+            workflow=self.workflow,
+            script_path=self.script_path,
+            details=self.workflow_details,
         )
-        plan = self.manager.add_plan("MHD visualization script", location=location)
-        self.plan = (plan, location)
+        self.plan = (workflow_plan.reference, workflow_plan.script_dataset)
         return self.plan
 
     def record(

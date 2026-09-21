@@ -1,9 +1,13 @@
 """Focused unit tests for transformations used by the example scripts."""
 
+import subprocess
+from pathlib import Path
+
 import numpy as np
 
 from scripts.adios_derived_variables import computeDerivedFields, resolveVarName
 from scripts.adios_stats import computeStats
+from scripts.mhd_provenance import github_script_location
 from scripts.render_adios_visualizations_to_campaign import resolve_var_name, visualization_semantic_kwargs
 
 
@@ -44,3 +48,56 @@ def test_streamline_metadata_records_physical_components_and_background() -> Non
         "streamline_by": ("run_vx", "run_vy"),
         "color_by": "run_speed",
     }
+
+
+def test_github_script_location_uses_an_immutable_commit_url(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    script = repository / "workflow.py"
+    script.write_text("print('workflow')\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "add", "workflow.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Provenance Test",
+            "-c",
+            "user.email=provenance@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "Add workflow",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "remote", "add", "origin", "git@github.com:example/workflows.git"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "update-ref", "refs/remotes/origin/main", "HEAD"],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    location = github_script_location(script)
+
+    assert location == f"https://github.com/example/workflows/blob/{commit}/workflow.py"
+
+    script.write_text("print('modified workflow')\n", encoding="utf-8")
+    assert github_script_location(script) is None
+
+
+def test_github_script_location_rejects_an_untracked_file(tmp_path: Path) -> None:
+    script = tmp_path / "workflow.py"
+    script.write_text("print('local workflow')\n", encoding="utf-8")
+
+    assert github_script_location(script) is None

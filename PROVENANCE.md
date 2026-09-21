@@ -81,13 +81,33 @@ QoI Activity and derived from its exact source.
 
 The simulation run is associated with the `ot_mhd` software Agent and its
 run-specific `input_parameters.txt` Plan. Derived calculations and statistics
-are associated with NumPy and shared script Plans. Visualization Activities are
-associated with Matplotlib and one shared rendering-script Plan.
+are associated with NumPy and a configured workflow Plan for each processing
+invocation. Visualization Activities are associated with Matplotlib and the
+configured workflow Plan for the rendering invocation that created them.
 
 Each processing Activity also has a compact ActionSpecification. Examples
 include the operation name, statistics requested, rendering parameters, and a
 campaign-local reference to the script. Reusable scripts are stored once and
-shared across runs to avoid duplicating provenance metadata.
+shared across runs to avoid duplicating provenance metadata. The workflow Plan
+records configuration shared by all Activities in one invocation, while each
+ActionSpecification records the resolved parameters for one Activity.
+
+A workflow Plan's location points to an immutable GitHub URL when its script is
+tracked, unchanged, and the current commit is known through the `origin` remote.
+Otherwise it points to the embedded campaign-local script. The script is
+embedded in both cases so the campaign remains self-contained.
+
+For example, a pressure-gradient heatmap has two Plans and two Activities:
+
+```text
+gradientPlan [script: adios_derived_variables.py]
+  -> gradientActivity(output.bp:pressure)
+  -> analysis.bp:grad_pressure_abs
+
+heatmapPlan [script: render_adios_visualizations_to_campaign.py]
+  -> heatmapActivity(analysis.bp:grad_pressure_abs)
+  -> pressure-gradient heatmap
+```
 
 ## Time-varying products and images
 
@@ -142,8 +162,9 @@ for inspection, interchange, and use with other PROV tooling.
 
 ## Intentional first-version boundaries
 
-- Workflows are reconstructed by tracing Activity inputs and outputs; there is
-  no separate named workflow execution object yet.
+- Workflow Plans group the processing Activities created by one configured
+  invocation. There is no separate workflow-execution Activity with status or
+  start/end timestamps yet.
 - A growing time series remains one Entity; timestep revisions are not modeled.
 - Units and coordinate systems are descriptive strings only.
 - The example recognizes its default primary and derived BP names,

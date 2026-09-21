@@ -266,6 +266,20 @@ def main() -> int:
         print(f"[info] datasets : {len(datasets)}")
         print(f"[info] variables: {'<all>' if args.allVariables else variables}")
         print(f"[info] visType  : {normalize_vis_type(args.visType)}")
+        workflow_details = {
+            "selection": {
+                "datasets": [dataset.name for dataset in datasets],
+                "dataset_patterns": patterns,
+                "requested_datasets": exact_names,
+                "variables": "all" if args.allVariables else variables,
+                "steps": "all" if args.allSteps else {"index": args.step},
+            },
+            "parameters": {
+                "dtype": args.dtype or "source",
+                "visualization_type": normalize_vis_type(args.visType),
+            },
+            "output_policy": {"replace": bool(args.replace)},
+        }
 
         directory_map = build_directory_map(info_data)
         for dataset in datasets:
@@ -341,7 +355,12 @@ def main() -> int:
                     set(discover_variables(bp_path)),
                 )
                 if provenance_recorder is None:
-                    provenance_recorder = VisualizationProvenanceRecorder(manager, Path(__file__))
+                    provenance_recorder = VisualizationProvenanceRecorder(
+                        manager,
+                        Path(__file__),
+                        workflow="store_scalar_fields",
+                        workflow_details=workflow_details,
+                    )
                 provenance_output = provenance_recorder.record(
                     source_dataset=dataset.name,
                     sequence_name=sequence_name,

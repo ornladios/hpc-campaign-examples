@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 
 import numpy as np
 from adios2.stream import Stream
 from hpc_campaign import Manager
 from hpc_campaign.prov_mapping import HPC
-from prov.model import ProvActivity, ProvDerivation, ProvEntity, ProvGeneration
+from prov.model import PROV, ProvActivity, ProvAssociation, ProvDerivation, ProvEntity, ProvGeneration
 
+from scripts.add_scalar_fields_to_campaign import add_scalar_field_sequence
 from scripts.adios_derived_variables import processFile as create_derived_dataset
 from scripts.adios_stats import processFile as create_statistics_dataset
 from scripts.mhd_provenance import (
@@ -18,7 +20,6 @@ from scripts.mhd_provenance import (
     active_document,
     record_campaign_provenance,
 )
-from scripts.add_scalar_fields_to_campaign import add_scalar_field_sequence
 from scripts.render_adios_visualizations_to_campaign import (
     add_visualization,
     visualization_sequence_name,
@@ -60,6 +61,34 @@ def _logical_entities(document) -> list[ProvEntity]:
         for record in document.get_records(ProvEntity)
         if HPC["LogicalVariable"] in record.get_asserted_types()
     ]
+
+
+def _activity_for_output(document, output):
+    generations = [
+        record
+        for record in document.get_records(ProvGeneration)
+        if record.args[0] == output
+    ]
+    assert len(generations) == 1
+    return generations[0].args[1]
+
+
+def _plan_for_activity(document, activity):
+    associations = [
+        record
+        for record in document.get_records(ProvAssociation)
+        if record.args[0] == activity
+    ]
+    assert len(associations) == 1
+    return associations[0].args[2]
+
+
+def _entity(document, reference):
+    return next(
+        record
+        for record in document.get_records(ProvEntity)
+        if record.identifier == reference
+    )
 
 
 def test_ingest_records_runs_derived_fields_and_statistics(tmp_path: Path) -> None:
@@ -121,6 +150,27 @@ def test_ingest_records_runs_derived_fields_and_statistics(tmp_path: Path) -> No
             if HPC["QuantityOfInterest"] in record.get_asserted_types()
         ]
         assert qoi_activities
+
+        gradient_plan = _plan_for_activity(document, _activity_for_output(document, divergence))
+        statistics_plan = _plan_for_activity(document, _activity_for_output(document, pressure_mean))
+        assert gradient_plan != statistics_plan
+
+        gradient_plan_entity = _entity(document, gradient_plan)
+        assert PROV["Plan"] in gradient_plan_entity.get_asserted_types()
+        assert gradient_plan_entity.get_attribute(PROV["label"]) == {"MHD derived-variable workflow"}
+        gradient_payload = json.loads(next(iter(gradient_plan_entity.get_attribute(PROV["value"]))))
+        assert gradient_payload["workflow"] == "derived_variables"
+        assert gradient_payload["implementation_dataset"] == "plans/adios_derived_variables.py"
+        assert set(gradient_payload["parameters"]["products"]) == {
+            "div_b",
+            "grad_pressure_abs",
+            "grad_rho_abs",
+        }
+
+        statistics_plan_entity = _entity(document, statistics_plan)
+        statistics_payload = json.loads(next(iter(statistics_plan_entity.get_attribute(PROV["value"]))))
+        assert statistics_payload["workflow"] == "descriptive_statistics"
+        assert statistics_payload["parameters"]["statistics"] == list(("min", "max", "mean", "median", "std", "var"))
     finally:
         manager.close()
 
@@ -159,6 +209,12 @@ def test_visualization_records_all_inputs_and_sequence_manifest(tmp_path: Path) 
         recorder = VisualizationProvenanceRecorder(
             manager,
             Path(__file__).parents[1] / "scripts" / "render_adios_visualizations_to_campaign.py",
+            workflow_details={
+                "selection": {
+                    "datasets": ["run-001/output.bp"],
+                    "variables": ["magnetic", "pressure"],
+                }
+            },
         )
         output = recorder.record(
             source_dataset="run-001/output.bp",
@@ -214,6 +270,34 @@ def test_visualization_records_all_inputs_and_sequence_manifest(tmp_path: Path) 
             record for record in _logical_entities(document) if record.identifier == pressure_output
         )
         assert pressure_entity.get_attribute(HPC["variableDefinition"]) == {"pressure_visualization"}
+
+        streamline_plan = _plan_for_activity(document, _activity_for_output(document, output))
+        pressure_plan = _plan_for_activity(document, _activity_for_output(document, pressure_output))
+        assert streamline_plan == pressure_plan
+        plan_entity = _entity(document, streamline_plan)
+        plan_payload = json.loads(next(iter(plan_entity.get_attribute(PROV["value"]))))
+        assert plan_payload["workflow"] == "render_visualizations"
+        assert plan_payload["selection"]["variables"] == ["magnetic", "pressure"]
+
+        second_recorder = VisualizationProvenanceRecorder(
+            manager,
+            Path(__file__).parents[1] / "scripts" / "render_adios_visualizations_to_campaign.py",
+            workflow_details={"selection": {"variables": ["pressure"]}},
+        )
+        second_output = second_recorder.record(
+            source_dataset="run-001/output.bp",
+            sequence_name=visualization_sequence_name("run-001/output.bp", "pressure_heatmap"),
+            vis_type="heatmap",
+            semantic_kwargs={"color_by": "sim_pressure"},
+            steps=[0],
+            rendering_parameters={"colormap": "viridis"},
+        )
+        updated_document = active_document(manager)
+        second_plan = _plan_for_activity(
+            updated_document,
+            _activity_for_output(updated_document, second_output),
+        )
+        assert second_plan != pressure_plan
     finally:
         manager.close()
 
@@ -250,6 +334,8 @@ def test_scalar_field_sequence_records_items_and_provenance(tmp_path: Path) -> N
         recorder = VisualizationProvenanceRecorder(
             manager,
             Path(__file__).parents[1] / "scripts" / "add_scalar_fields_to_campaign.py",
+            workflow="store_scalar_fields",
+            workflow_details={"parameters": {"dtype": "float32"}},
         )
         output = recorder.record(
             source_dataset="run-001/output.bp",
@@ -286,5 +372,9 @@ def test_scalar_field_sequence_records_items_and_provenance(tmp_path: Path) -> N
             if record.args[0] == output
         }
         assert actual_inputs == {expected_pressure}
+        plan = _plan_for_activity(document, _activity_for_output(document, output))
+        payload = json.loads(next(iter(_entity(document, plan).get_attribute(PROV["value"]))))
+        assert payload["workflow"] == "store_scalar_fields"
+        assert payload["parameters"]["dtype"] == "float32"
     finally:
         manager.close()
