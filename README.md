@@ -23,8 +23,8 @@ source /Users/dpn/proj/seurat/.venv/bin/activate
 ```
 
 Build the solver, rerun the ensemble into `./runs`, recreate the campaign,
-generate heatmap PNGs, streamlines, scalar-field sequences, and verify the
-archive:
+generate a pressure MP4 for each run alongside the heatmap PNGs, streamlines,
+and scalar-field sequences, and verify the archive:
 
 ```bash
 make all
@@ -93,11 +93,13 @@ The example refuses to overwrite existing generated outputs. Use a fresh
 - CMake 3.18 or newer
 - A C++17 compiler
 - ADIOS2 with C++ bindings
+- FFmpeg with the `libx264` encoder, for the movie target
+- An `hpc-campaign` version with the provenance API used by these examples, and
+  `Manager.video()` for the movie target
 - MPI, unless the solver is configured with `OT_ENABLE_MPI=OFF`
 
-On this branch, the Python project installs the matching experimental
-`hpc-campaign` branch along with the Matplotlib dependency used by the
-rendering script:
+The Python project installs `hpc-campaign` from its `master` branch along with
+Matplotlib, which the rendering script uses:
 
 ```bash
 python3 -m venv .venv
@@ -106,8 +108,11 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
 
-For development against an existing checkout instead, install that checkout
-after installing this project so its editable package takes precedence:
+As of October 15, 2026, `master` does not provide `VariableSpec` or
+`Manager.video()`, both of which these provenance and movie examples use. A
+clean install from the pinned branch is therefore not yet sufficient to run
+them. Install a checkout containing those APIs after this project so its
+editable package takes precedence:
 
 ```bash
 python -m pip install -e /path/to/hpc-campaign
@@ -133,9 +138,10 @@ The Makefile provides the common end-to-end workflow:
 make runs            # build and run the configured ensemble into ./runs
 make create          # recreate the ACA from ./runs, with derived fields and stats
 make heatmaps        # add primary and derived PNG heatmap image sequences
+make movies          # add one pressure MP4 per output.bp dataset and keep a local copy
 make streamlines     # add velocity and magnetic streamline image sequences
 make scalar-fields   # add raw SCALAR_FIELD visualization sequences
-make visualizations  # run heatmaps, streamlines, and scalar-fields
+make visualizations  # run movies, heatmaps, streamlines, and scalar-fields
 make verify          # print the ACA info table
 make all             # run runs, create, visualizations, and verify
 ```
@@ -144,7 +150,9 @@ make all             # run runs, create, visualizations, and verify
 rebuilds campaign registration, derived datasets, and statistics from
 `RUN_ROOT`. The visualization targets pass `--replace`; they replace matching
 visualization sequences by name, but they do not delete unrelated old
-sequences that are no longer selected by the Makefile variables.
+sequences that are no longer selected by the Makefile variables. Movie files
+remain on disk under `MOVIE_OUTPUT_DIR`, mirroring their campaign sequence
+paths, as well as being embedded in the ACA.
 
 Useful Make variables:
 
@@ -154,6 +162,7 @@ make runs RUN_ROOT=/path/to/runs
 make heatmaps PRIMARY_VARS=pressure,rho,current_z
 make heatmaps DERIVED_VARS=div_b,grad_pressure_abs
 make streamlines STREAMLINE_VARS=velocity,magnetic
+make movies ARCHIVE=/path/to/mhd.aca RUN_ROOT=/path/to/runs MOVIE_OUTPUT_DIR=/path/to/movies
 make scalar-fields SCALAR_PRIMARY_VARS=pressure,rho
 make scalar-fields SCALAR_DERIVED_VARS=div_b,grad_pressure_abs
 make scalar-fields SCALAR_FIELD_DTYPE=
@@ -162,6 +171,7 @@ make scalar-fields SCALAR_FIELD_DTYPE=
 Defaults:
 
 - `RUN_ROOT=$(CURDIR)/runs`
+- `MOVIE_OUTPUT_DIR=$(RUN_ROOT)/movies`; MP4s are kept here in paths mirroring their campaign sequence names
 - `ARCHIVE=/Users/dpn/ORNL_Dropbox/campaign-store/mhd_orszag_tang_runs_full.aca`
 - `PRIMARY_VARS=pressure,rho,speed,current_z`
 - `DERIVED_VARS=div_b,grad_pressure_abs,grad_rho_abs`

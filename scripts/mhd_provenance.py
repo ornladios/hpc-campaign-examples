@@ -630,6 +630,7 @@ class VisualizationProvenanceRecorder:
         semantic_kwargs: dict[str, Any],
         steps: list[int],
         rendering_parameters: dict[str, Any],
+        output_variable: str = "image_sequence",
     ) -> QualifiedName:
         """Record one sequence as a single time-varying logical data product."""
         document = active_document(self.manager)
@@ -680,10 +681,10 @@ class VisualizationProvenanceRecorder:
             "visualization",
             inputs={role: record.identifier for role, record in records.items()},
             outputs={
-                "image_sequence": VariableSpec(
+                output_variable: VariableSpec(
                     run=run,
                     dataset=manifest_name,
-                    variable="image_sequence",
+                    variable=output_variable,
                     definition=definition,
                 )
             },
@@ -699,4 +700,4 @@ class VisualizationProvenanceRecorder:
             plan=plan,
             activity_id=activity_id,
         )
-        return result.outputs["image_sequence"]
+        return result.outputs[output_variable]

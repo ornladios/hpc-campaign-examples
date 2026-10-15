@@ -1,6 +1,7 @@
 PYTHON ?= python
 CONFIG ?= ensembles/simple.json
 RUN_ROOT ?= $(CURDIR)/runs
+MOVIE_OUTPUT_DIR ?= $(RUN_ROOT)/movies
 ARCHIVE ?= /Users/dpn/ORNL_Dropbox/campaign-store/mhd_orszag_tang_runs_full.aca
 BUILD_DIR ?= build
 PRIMARY_VARS ?= pressure,rho,speed,current_z
@@ -11,7 +12,7 @@ SCALAR_DERIVED_VARS ?= div_b,grad_pressure_abs,grad_rho_abs
 SCALAR_FIELD_DTYPE ?= float32
 SCALAR_FIELD_DTYPE_ARG = $(if $(SCALAR_FIELD_DTYPE),--dtype $(SCALAR_FIELD_DTYPE),)
 
-.PHONY: all env build runs create visualizations heatmaps primary-heatmaps derived-heatmaps streamlines scalar-fields scalar-primary-fields scalar-derived-fields vis-pressure vis-streamlines verify
+.PHONY: all env build runs create visualizations movies heatmaps primary-heatmaps derived-heatmaps streamlines scalar-fields scalar-primary-fields scalar-derived-fields vis-pressure vis-streamlines verify
 
 all: runs create visualizations verify
 
@@ -40,7 +41,19 @@ create:
 		--recreate \
 		--showInfo
 
-visualizations: heatmaps streamlines scalar-fields
+visualizations: movies heatmaps streamlines scalar-fields
+
+movies:
+	$(PYTHON) scripts/render_adios_visualizations_to_campaign.py \
+		--archive $(ARCHIVE) \
+		--datasetPattern '*/output.bp' \
+		--variable pressure \
+		--data_root $(RUN_ROOT) \
+		--allSteps \
+		--movie \
+		--movieOutputDir $(MOVIE_OUTPUT_DIR) \
+		--replace \
+		--showInfo
 
 heatmaps: primary-heatmaps derived-heatmaps
 

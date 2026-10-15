@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from adios2.stream import Stream
 from hpc_campaign import Manager
 from hpc_campaign.prov_mapping import HPC
 from prov.model import ProvActivity, ProvDerivation, ProvEntity, ProvGeneration
 
+from scripts.add_scalar_fields_to_campaign import add_scalar_field_sequence
 from scripts.adios_derived_variables import processFile as create_derived_dataset
 from scripts.adios_stats import processFile as create_statistics_dataset
 from scripts.mhd_provenance import (
@@ -18,10 +21,10 @@ from scripts.mhd_provenance import (
     active_document,
     record_campaign_provenance,
 )
-from scripts.add_scalar_fields_to_campaign import add_scalar_field_sequence
 from scripts.render_adios_visualizations_to_campaign import (
     add_visualization,
     visualization_sequence_name,
+    visualization_variable_specs,
 )
 
 # A valid one-pixel PNG keeps the visualization test independent of rendering
@@ -31,8 +34,8 @@ TINY_PNG = base64.b64decode(
 )
 
 
-def _write_prefixed_source(path: Path) -> None:
-    """Write one self-describing MHD step using code-specific names."""
+def _write_prefixed_source(path: Path, time_values: list[float] | None = None) -> None:
+    """Write self-describing MHD steps using code-specific names."""
     y, x = np.mgrid[0:3, 0:4]
     fields = {
         "sim_rho": 1.0 + x + y,
@@ -40,12 +43,16 @@ def _write_prefixed_source(path: Path) -> None:
         "sim_bx": x.astype(np.float64),
         "sim_by": y.astype(np.float64),
     }
+    resolved_times = [0.0] if time_values is None else time_values
     with Stream(str(path), "w") as stream:
-        stream.begin_step()
-        for name, values in fields.items():
-            data = np.asarray(values, dtype=np.float64)
-            stream.write(name, data, data.shape, [0, 0], data.shape)
-        stream.end_step()
+        for time_value in resolved_times:
+            stream.begin_step()
+            for name, values in fields.items():
+                data = np.asarray(values, dtype=np.float64)
+                stream.write(name, data, data.shape, [0, 0], data.shape)
+            time_array = np.asarray([time_value], dtype=np.float64)
+            stream.write("time", time_array, time_array.shape, [0], [1])
+            stream.end_step()
 
 
 def _register_datasets(manager: Manager, root: Path, paths: list[Path]) -> None:
@@ -214,6 +221,72 @@ def test_visualization_records_all_inputs_and_sequence_manifest(tmp_path: Path) 
             record for record in _logical_entities(document) if record.identifier == pressure_output
         )
         assert pressure_entity.get_attribute(HPC["variableDefinition"]) == {"pressure_visualization"}
+    finally:
+        manager.close()
+
+
+@pytest.mark.skipif(not hasattr(Manager, "video"), reason="requires a video-capable hpc-campaign checkout")
+def test_video_sequence_records_semantic_roles_time_and_provenance(tmp_path: Path) -> None:
+    """Video metadata must retain semantic variable roles and time lineage."""
+    run_dir = tmp_path / "run-001"
+    run_dir.mkdir()
+    source = run_dir / "output.bp"
+    movie = tmp_path / "pressure.mp4"
+    movie.write_bytes(b"opaque mp4 payload")
+    _write_prefixed_source(source, time_values=[0.0, 0.25, 1.0])
+
+    manager = Manager(archive="mhd.aca", campaign_store=str(tmp_path))
+    manager.open(create=True, truncate=True)
+    try:
+        _register_datasets(manager, tmp_path, [source])
+        index = record_campaign_provenance(manager, [source], tmp_path)
+        source_dataset = "run-001/output.bp"
+        sequence_name = visualization_sequence_name(source_dataset, "pressure_movie")
+        semantic_kwargs = {"color_by": "sim_pressure"}
+        manager.video(
+            movie,
+            name=f"{sequence_name}.mp4",
+            variables=visualization_variable_specs(semantic_kwargs, source_dataset),
+            vis_type="heatmap",
+            source_dataset=source_dataset,
+            sequence_name=sequence_name,
+            time_variable=(source_dataset, "time"),
+            time_indices=[0, 1, 2],
+            frame_count=3,
+            store=True,
+        )
+
+        info = manager.info(list_replicas=True, list_files=True)
+        sequence = next(item for item in info.visualization_sequences.values() if item.name == sequence_name)
+        assert [(item.name, item.role, item.source_dataset_name) for item in sequence.variables] == [
+            ("sim_pressure", "color-by", source_dataset)
+        ]
+        assert sequence.items[0].item_type == "VIDEO"
+        assert sequence.items[0].file_format == "VIDEO"
+        item_metadata = json.loads(sequence.items[0].metadata or "{}")
+        assert item_metadata["time_values"] == [0.0, 0.25, 1.0]
+        assert item_metadata["time_source"]["indices"] == [0, 1, 2]
+
+        recorder = VisualizationProvenanceRecorder(
+            manager,
+            Path(__file__).parents[1] / "scripts" / "render_adios_visualizations_to_campaign.py",
+        )
+        output = recorder.record(
+            source_dataset=source_dataset,
+            sequence_name=sequence_name,
+            vis_type="heatmap",
+            semantic_kwargs=semantic_kwargs,
+            steps=[0, 1, 2],
+            rendering_parameters={"frame_rate": 10.0},
+            output_variable="video",
+        )
+        document = active_document(manager)
+        output_parents = {
+            record.args[1]
+            for record in document.get_records(ProvDerivation)
+            if record.args[0] == output
+        }
+        assert output_parents == {index.by_definition[("run-001", "pressure")].reference}
     finally:
         manager.close()
 

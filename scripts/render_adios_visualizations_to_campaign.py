@@ -16,6 +16,8 @@ import argparse
 import fnmatch
 import io
 import os
+import shutil
+import subprocess
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -178,6 +180,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--step", type=int, default=-1, help="Step to render. Negative means from the end.")
     parser.add_argument("--allSteps", action="store_true", help="Render every ADIOS step instead of --step.")
+    parser.add_argument(
+        "--movie",
+        action="store_true",
+        help="Encode the rendered frames as an MP4 and register a VIDEO item instead of an image sequence.",
+    )
+    parser.add_argument("--fps", type=float, default=10.0, help="Frame rate used with --movie.")
+    parser.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg executable used with --movie.")
+    parser.add_argument(
+        "--movieOutputDir",
+        type=Path,
+        default=Path("movies"),
+        help="Directory for persistent MP4 files, mirroring their campaign sequence paths (default: ./movies).",
+    )
     parser.add_argument("--visType", default="heatmap", help="Visualization kind recorded in the campaign.")
     parser.add_argument("--cmap", default="viridis", help="matplotlib colormap for 2D fields.")
     parser.add_argument("--divergingCmap", default="RdBu_r", help="matplotlib colormap for signed 2D fields.")
@@ -986,6 +1001,49 @@ def visualization_semantic_kwargs(
     return {"color_by": variable}
 
 
+def visualization_variable_specs(
+    semantic_kwargs: dict[str, Any],
+    source_dataset: str,
+) -> list[dict[str, str]]:
+    """Convert visualization semantic arguments to campaign variable specs."""
+    specifications: list[dict[str, str]] = []
+
+    def add(name: Any, role: str) -> None:
+        if name is not None:
+            specifications.append(
+                {
+                    "name": str(name),
+                    "role": role,
+                    "source_dataset": source_dataset,
+                }
+            )
+
+    for argument, role in (
+        ("variable", "primary"),
+        ("color_by", "color-by"),
+        ("contour_by", "contour-by"),
+        ("x_axis", "x-axis"),
+    ):
+        add(semantic_kwargs.get(argument), role)
+
+    streamline_by = semantic_kwargs.get("streamline_by")
+    if streamline_by is not None:
+        components = [streamline_by] if isinstance(streamline_by, str) else list(streamline_by)
+        if len(components) == 2:
+            add(components[0], "streamline-x")
+            add(components[1], "streamline-y")
+        else:
+            for component in components:
+                add(component, "streamline-by")
+
+    y_axis = semantic_kwargs.get("y_axis")
+    if y_axis is not None:
+        for name in ([y_axis] if isinstance(y_axis, str) else y_axis):
+            add(name, "y-axis")
+
+    return specifications
+
+
 def visualization_name(variable: str, vis_type: str, explicit_name: str | None, variable_count: int) -> str:
     """Return a stable visualization name for replace=True reruns."""
     if explicit_name is not None:
@@ -1004,6 +1062,45 @@ def visualization_sequence_name(dataset_name: str, name: str) -> str:
     return name if "/" in name else f"{dataset_name}/visualizations/{name}"
 
 
+def encode_mp4(images: list[bytes], output_path: Path, fps: float, ffmpeg: str = "ffmpeg") -> Path:
+    """Encode rendered PNG bytes in their existing order into an H.264 MP4."""
+    if not images:
+        raise ValueError("Cannot encode a movie without frames")
+    if fps <= 0:
+        raise ValueError("Movie frame rate must be positive")
+    executable = shutil.which(ffmpeg)
+    if executable is None:
+        raise FileNotFoundError(f"FFmpeg executable not found: {ffmpeg}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="hpc_campaign_movie_frames_") as temp_dir:
+        frame_dir = Path(temp_dir)
+        for index, image in enumerate(images):
+            (frame_dir / f"frame.{index:06d}.png").write_bytes(image)
+        command = [
+            executable,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-framerate",
+            str(fps),
+            "-i",
+            str(frame_dir / "frame.%06d.png"),
+            "-c:v",
+            "libx264",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        subprocess.run(command, check=True)
+    return output_path
+
+
 def _safe_relative_parts(path_text: str) -> list[str]:
     """Convert a logical campaign path into safe relative filesystem parts."""
     parts: list[str] = []
@@ -1015,6 +1112,12 @@ def _safe_relative_parts(path_text: str) -> list[str]:
     if not parts:
         raise SystemExit(f"Cannot build output path from empty logical path: {path_text!r}")
     return parts
+
+
+def movie_file_path(movie_output_dir: Path, sequence_name: str) -> Path:
+    """Return a persistent MP4 path mirroring its logical sequence name."""
+    relative_path = Path(*_safe_relative_parts(f"{sequence_name}.mp4"))
+    return movie_output_dir / relative_path
 
 
 def write_png_images(
@@ -1191,14 +1294,25 @@ def main() -> int:
 
     data_root = args.data_root.expanduser().resolve() if args.data_root is not None else None
     image_output_dir = args.imageOutputDir.expanduser().resolve() if args.imageOutputDir is not None else None
+    movie_output_dir = args.movieOutputDir.expanduser().resolve()
     if args.externalImages and image_output_dir is None:
         raise SystemExit("--externalImages requires --imageOutputDir.")
+    if args.movie and args.externalImages:
+        raise SystemExit("--externalImages applies to PNG sequences and cannot be used with --movie.")
+    if args.movie and args.fps <= 0:
+        raise SystemExit("--fps must be positive when using --movie.")
     if image_output_dir is not None and not args.dryRun:
         image_output_dir.mkdir(parents=True, exist_ok=True)
+    if args.movie and not args.dryRun:
+        movie_output_dir.mkdir(parents=True, exist_ok=True)
 
     figure_size = (float(args.figureWidth), float(args.figureHeight))
 
     manager_class, format_info_fn = _import_hpc_campaign()
+    if args.movie and not args.dryRun and not callable(getattr(manager_class, "video", None)):
+        raise SystemExit(
+            "--movie requires hpc-campaign.Manager.video(); install a video-capable hpc-campaign version."
+        )
     manager = manager_class(archive=args.archive, campaign_store=args.campaign_store)
     manager.open(create=False)
 
@@ -1253,7 +1367,8 @@ def main() -> int:
                         args.name,
                         len(dataset_variables),
                     )
-                    print(f"[dry-run] {dataset.name} variable={variable} visualization={name}")
+                    suffix = "_movie.mp4 (VIDEO)" if args.movie else " (image sequence)"
+                    print(f"[dry-run] {dataset.name} variable={variable} visualization={name}{suffix}")
                 continue
 
             for variable in dataset_variables:
@@ -1281,6 +1396,68 @@ def main() -> int:
                     raise SystemExit(str(exc)) from exc
 
                 name = visualization_name(variable, resolved_vis_type, args.name, len(dataset_variables))
+                if args.movie and len(images) != len(steps):
+                    message = (
+                        f"--movie requires one rendered image per timestep; got {len(images)} images "
+                        f"for {len(steps)} steps."
+                    )
+                    raise SystemExit(message)
+                semantic_kwargs = visualization_semantic_kwargs(
+                    physical_variable,
+                    resolved_vis_type,
+                    set(discover_variables(bp_path)),
+                )
+                if args.movie:
+                    movie_sequence_name = visualization_sequence_name(dataset.name, f"{name}_movie")
+                    movie_path = encode_mp4(
+                        images,
+                        movie_file_path(movie_output_dir, movie_sequence_name),
+                        args.fps,
+                        args.ffmpeg,
+                    )
+                    video_variables = visualization_variable_specs(semantic_kwargs, dataset.name)
+                    visid = manager.video(
+                        movie_path,
+                        name=f"{movie_sequence_name}.mp4",
+                        variables=video_variables,
+                        vis_type=resolved_vis_type,
+                        source_dataset=dataset.name,
+                        sequence_name=movie_sequence_name,
+                        time_variable=(dataset.name, "time"),
+                        time_indices=steps,
+                        frame_count=len(images),
+                        time_unit="s",
+                        store=True,
+                        replace=args.replace,
+                    )
+                    print(
+                        f"[ok] added video visid={visid} name={movie_sequence_name} "
+                        f"frames={len(images)} fps={args.fps:g} file={movie_path}"
+                    )
+                    if provenance_recorder is None:
+                        provenance_recorder = VisualizationProvenanceRecorder(manager, Path(__file__))
+                    provenance_output = provenance_recorder.record(
+                        source_dataset=dataset.name,
+                        sequence_name=movie_sequence_name,
+                        vis_type=resolved_vis_type,
+                        semantic_kwargs=semantic_kwargs,
+                        steps=steps,
+                        rendering_parameters={
+                            "sequential_colormap": args.cmap,
+                            "diverging_colormap": args.divergingCmap,
+                            "contour_levels": args.contourLevels,
+                            "contour_line_width": args.contourLineWidth,
+                            "dpi": args.dpi,
+                            "figure_size_inches": [args.figureWidth, args.figureHeight],
+                            "frame_rate": args.fps,
+                            "encoder": args.ffmpeg,
+                        },
+                        output_variable="video",
+                    )
+                    print(f"[ok] provenance output={provenance_output}")
+                    added += 1
+                    continue
+
                 visualization_images, image_workdir = prepare_visualization_images(
                     rendered_images=images,
                     steps=steps,
@@ -1290,11 +1467,6 @@ def main() -> int:
                     external_images=bool(args.externalImages),
                 )
 
-                semantic_kwargs = visualization_semantic_kwargs(
-                    physical_variable,
-                    resolved_vis_type,
-                    set(discover_variables(bp_path)),
-                )
                 visid = add_visualization(
                     manager=manager,
                     dataset_name=dataset.name,
