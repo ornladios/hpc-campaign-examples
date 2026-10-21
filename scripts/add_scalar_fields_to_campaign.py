@@ -24,6 +24,7 @@ try:
         build_directory_map,
         discover_variables,
         live_adios_datasets,
+        new_visualization_product_root,
         normalize_vis_type,
         read_variable_arrays,
         resolve_dataset_path,
@@ -41,6 +42,7 @@ except ImportError:  # Direct execution places scripts/ rather than the repo roo
         build_directory_map,
         discover_variables,
         live_adios_datasets,
+        new_visualization_product_root,
         normalize_vis_type,
         read_variable_arrays,
         resolve_dataset_path,
@@ -169,6 +171,7 @@ def add_scalar_field_sequence(
         raise SystemExit("No scalar fields were selected.")
 
     sequence_name = visualization_sequence_name(dataset_name, name)
+    product_root = new_visualization_product_root(manager, sequence_name, replace)
     item_names: list[str] = []
     for step, array in zip(steps, arrays, strict=True):
         field = to_scalar_field_array(
@@ -177,7 +180,7 @@ def add_scalar_field_sequence(
             variable=variable,
             step=step,
         )
-        item_name = scalar_field_item_name(sequence_name, step)
+        item_name = scalar_field_item_name(product_root, step)
         item_metadata = dict(metadata or {})
         item_metadata.update(
             {
@@ -206,6 +209,7 @@ def add_scalar_field_sequence(
             "steps": [int(step) for step in steps],
             "scalar_fields": True,
             "dtype": dtype or "source",
+            "product_root": product_root,
         },
         replace=replace,
     )

@@ -26,7 +26,7 @@ build:
 
 runs: build
 	$(PYTHON) scripts/run_ensembles.py \
-		--binary ./$(BUILD_DIR)/ot_mhd \
+		--binary $(abspath $(BUILD_DIR)/ot_mhd) \
 		--config $(CONFIG) \
 		--output-dir $(RUN_ROOT)
 
@@ -125,4 +125,5 @@ scalar-derived-fields:
 		--showInfo
 
 verify:
+	$(PYTHON) scripts/verify_campaign.py --archive $(ARCHIVE)
 	sqlite3 $(ARCHIVE) "select * from info;"

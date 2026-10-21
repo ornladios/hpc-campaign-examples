@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -1062,6 +1063,15 @@ def visualization_sequence_name(dataset_name: str, name: str) -> str:
     return name if "/" in name else f"{dataset_name}/visualizations/{name}"
 
 
+def new_visualization_product_root(manager, sequence_name: str, replace: bool) -> str:
+    """Keep the sequence name stable while giving each render new products."""
+    if not replace:
+        sequences = manager.info(list_replicas=False, list_files=False).visualization_sequences.values()
+        if any(sequence.name == sequence_name for sequence in sequences):
+            raise ValueError(f"Visualization sequence already exists: {sequence_name}")
+    return f"{sequence_name}/revisions/{uuid.uuid4().hex}"
+
+
 def encode_mp4(images: list[bytes], output_path: Path, fps: float, ffmpeg: str = "ffmpeg") -> Path:
     """Encode rendered PNG bytes in their existing order into an H.264 MP4."""
     if not images:
@@ -1194,6 +1204,7 @@ def add_visualization(
     thumbnail_step: int,
     image_workdir: Path | None = None,
     semantic_kwargs: dict[str, Any] | None = None,
+    product_root: str | None = None,
 ) -> int | None:
     """Store or register rendered images with new visualization metadata."""
     if not images:
@@ -1214,6 +1225,12 @@ def add_visualization(
         )
         return None
 
+    sequence_name = visualization_sequence_name(dataset_name, name)
+    if product_root is None:
+        product_root = new_visualization_product_root(manager, sequence_name, replace)
+    output_steps = image_steps if image_steps is not None else range(len(images))
+    image_names = [f"{product_root}/image.{int(step):06d}.png" for step in output_steps]
+
     cwd = Path.cwd()
     if image_workdir is not None:
         os.chdir(image_workdir)
@@ -1224,6 +1241,7 @@ def add_visualization(
             source_dataset=dataset_name,
             name=name,
             steps=image_steps,
+            image_names=image_names,
             thumbnail_image=thumbnail_step,
             # In-memory PNG bytes have no external replica path and therefore
             # must be embedded. Paths under image_workdir are intentionally
@@ -1233,6 +1251,7 @@ def add_visualization(
                 "generated_by": Path(__file__).name,
                 "steps": steps,
                 "external_images": image_workdir is not None,
+                "product_root": product_root,
             },
             replace=replace,
             **(semantic_kwargs or visualization_semantic_kwargs(variable, vis_type)),
@@ -1249,13 +1268,16 @@ def prepare_visualization_images(
     name: str,
     image_output_dir: Path | None,
     external_images: bool,
+    product_root: str | None = None,
 ) -> tuple[list[bytes | Path], Path | None]:
     """Optionally write PNGs and return the inputs for Manager.visualization()."""
     if image_output_dir is None:
         return (rendered_images, None)
 
-    sequence_name = visualization_sequence_name(dataset_name, name)
-    written_paths = write_png_images(image_output_dir, sequence_name, steps, rendered_images)
+    if product_root is None:
+        sequence_name = visualization_sequence_name(dataset_name, name)
+        product_root = f"{sequence_name}/revisions/{uuid.uuid4().hex}"
+    written_paths = write_png_images(image_output_dir, product_root, steps, rendered_images)
     print(f"[ok] wrote PNG files: {written_paths[0].parent}")
 
     if not external_images:
@@ -1409,16 +1431,17 @@ def main() -> int:
                 )
                 if args.movie:
                     movie_sequence_name = visualization_sequence_name(dataset.name, f"{name}_movie")
+                    product_root = new_visualization_product_root(manager, movie_sequence_name, args.replace)
                     movie_path = encode_mp4(
                         images,
-                        movie_file_path(movie_output_dir, movie_sequence_name),
+                        movie_file_path(movie_output_dir, f"{product_root}/movie"),
                         args.fps,
                         args.ffmpeg,
                     )
                     video_variables = visualization_variable_specs(semantic_kwargs, dataset.name)
                     visid = manager.video(
                         movie_path,
-                        name=f"{movie_sequence_name}.mp4",
+                        name=f"{product_root}/movie.mp4",
                         variables=video_variables,
                         vis_type=resolved_vis_type,
                         source_dataset=dataset.name,
@@ -1458,6 +1481,8 @@ def main() -> int:
                     added += 1
                     continue
 
+                sequence_name = visualization_sequence_name(dataset.name, name)
+                product_root = new_visualization_product_root(manager, sequence_name, args.replace)
                 visualization_images, image_workdir = prepare_visualization_images(
                     rendered_images=images,
                     steps=steps,
@@ -1465,6 +1490,7 @@ def main() -> int:
                     name=name,
                     image_output_dir=image_output_dir,
                     external_images=bool(args.externalImages),
+                    product_root=product_root,
                 )
 
                 visid = add_visualization(
@@ -1479,8 +1505,8 @@ def main() -> int:
                     thumbnail_step=args.thumbnailStep,
                     image_workdir=image_workdir,
                     semantic_kwargs=semantic_kwargs,
+                    product_root=product_root,
                 )
-                sequence_name = visualization_sequence_name(dataset.name, name)
                 if visid is None:
                     print(f"[ok] added image sequence name={sequence_name} images={len(images)}")
                 else:

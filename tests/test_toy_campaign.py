@@ -5,13 +5,11 @@ from pathlib import Path
 from adios2.stream import Stream
 from hpc_campaign import Manager
 from hpc_campaign.prov_mapping import HPC
-from prov.model import PROV, ProvActivity, ProvDerivation, ProvEntity
+from prov.model import PROV, ProvActivity, ProvDerivation, ProvEntity, ProvGeneration
 
 from scripts.toy_campaign import (
     FILE1_DATASET,
-    FILE1_VISUALIZATION_IMAGE_FILE,
     FILE2_DATASET,
-    FILE2_VISUALIZATION_IMAGE_FILE,
     VARIABLE_NAME,
     ToyCampaignResult,
     build_toy_campaign,
@@ -106,46 +104,54 @@ def test_toy_campaign_builds_two_files_visualization_and_prov(tmp_path: Path) ->
         asserted_types = {
             asserted_type for record in document.get_records() for asserted_type in record.get_asserted_types()
         }
-        assert HPC["SimulationRun"] in asserted_types
+        assert HPC["Simulation"] in asserted_types
         assert HPC["Visualization"] in asserted_types
 
-        run_labels = {
+        simulation_labels = {
             str(next(iter(record.get_attribute(PROV["label"]))))
             for record in document.get_records(ProvActivity)
-            if HPC["SimulationRun"] in record.get_asserted_types()
+            if HPC["Simulation"] in record.get_asserted_types()
         }
-        assert run_labels == {"sim1", "sim2"}
+        assert simulation_labels == {"sim1", "sim2"}
 
         file1_var = _logical_variable_by_dataset(document, FILE1_DATASET, VARIABLE_NAME)
         file2_var = _logical_variable_by_dataset(document, FILE2_DATASET, VARIABLE_NAME)
         assert file1_var.get_attribute(HPC["variableDefinition"]) == {"var"}
         assert file2_var.get_attribute(HPC["variableDefinition"]) == {"var"}
-        file1_image = _logical_variable_by_dataset(
-            document,
-            result.file1_visualization_image_dataset,
-            FILE1_VISUALIZATION_IMAGE_FILE,
-        )
-        file2_image = _logical_variable_by_dataset(
-            document,
-            result.file2_visualization_image_dataset,
-            FILE2_VISUALIZATION_IMAGE_FILE,
-        )
-        assert file1_image.get_attribute(HPC["variableDefinition"]) == {"var_visualization"}
-        assert file2_image.get_attribute(HPC["variableDefinition"]) == {"var_visualization"}
+        file1_sequence = manager.visualization_sequence_entity(result.file1_visualization_sequence)
+        file2_sequence = manager.visualization_sequence_entity(result.file2_visualization_sequence)
+        assert HPC["ImageSequence"] in document.get_record(file1_sequence)[0].get_asserted_types()
+        assert HPC["ImageSequence"] in document.get_record(file2_sequence)[0].get_asserted_types()
+        file1_image = manager.dataset_entity(result.file1_visualization_image_dataset)
+        file2_image = manager.dataset_entity(result.file2_visualization_image_dataset)
+        assert HPC["Image"] in document.get_record(file1_image)[0].get_asserted_types()
+        assert HPC["Image"] in document.get_record(file2_image)[0].get_asserted_types()
 
-        # Each generated image traces back to the var from its own file.
+        # Each generated sequence traces back to the var from its own file.
         file1_parents = {
             record.args[1]
             for record in document.get_records(ProvDerivation)
-            if record.args[0] == file1_image.identifier
+            if record.args[0] == file1_sequence
         }
         file2_parents = {
             record.args[1]
             for record in document.get_records(ProvDerivation)
-            if record.args[0] == file2_image.identifier
+            if record.args[0] == file2_sequence
         }
         assert file1_parents == {file1_var.identifier}
         assert file2_parents == {file2_var.identifier}
+
+        generations = {
+            record.args[0]: record.args[1]
+            for record in document.get_records(ProvGeneration)
+        }
+        simulations = {
+            str(next(iter(record.get_attribute(PROV["label"])))): record.identifier
+            for record in document.get_records(ProvActivity)
+            if HPC["Simulation"] in record.get_asserted_types()
+        }
+        assert generations[file1_var.identifier] == simulations["sim1"]
+        assert generations[file2_var.identifier] == simulations["sim2"]
 
         visualization_activities = [
             record
@@ -153,5 +159,7 @@ def test_toy_campaign_builds_two_files_visualization_and_prov(tmp_path: Path) ->
             if HPC["Visualization"] in record.get_asserted_types()
         ]
         assert len(visualization_activities) == 2
+        assert generations[file1_sequence] in {activity.identifier for activity in visualization_activities}
+        assert generations[file2_sequence] in {activity.identifier for activity in visualization_activities}
     finally:
         manager.close()

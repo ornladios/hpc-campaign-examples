@@ -7,9 +7,7 @@ answer questions such as "which pressure field produced this image?".
 
 from __future__ import annotations
 
-import json
 import re
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
@@ -18,7 +16,7 @@ from typing import Any
 
 import numpy as np
 from adios2.stream import Stream
-from hpc_campaign import Manager, VariableSpec
+from hpc_campaign import Manager
 from hpc_campaign.prov_mapping import HPC
 from prov.model import ProvDocument, ProvEntity, QualifiedName
 
@@ -145,7 +143,7 @@ class LogicalProduct:
 class ProvenanceIndex:
     """References created while ingesting one campaign."""
 
-    runs: dict[str, QualifiedName] = field(default_factory=dict)
+    simulations: dict[str, QualifiedName] = field(default_factory=dict)
     by_physical: dict[tuple[str, str], LogicalProduct] = field(default_factory=dict)
     by_definition: dict[tuple[str, str], LogicalProduct] = field(default_factory=dict)
 
@@ -220,14 +218,6 @@ def _store_plan_source(manager: Manager, source: Path, logical_name: str) -> str
     return logical_name
 
 
-def _store_json(manager: Manager, logical_name: str, payload: dict[str, Any]) -> None:
-    """Embed JSON as a normal TEXT dataset without leaving a temporary file."""
-    with tempfile.TemporaryDirectory(prefix="mhd_provenance_") as temporary:
-        source = Path(temporary) / "manifest.json"
-        source.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        manager.text(source, name=logical_name, store=True)
-
-
 def _source_dataset_for_stats(stats_dataset: str) -> str:
     path = Path(stats_dataset)
     stem = path.stem
@@ -256,16 +246,15 @@ def _register_source_variables(
     manager: Manager,
     index: ProvenanceIndex,
     run_name: str,
-    run: QualifiedName,
     dataset: str,
     path: Path,
-) -> None:
-    for physical_name in discover_adios_variables(path):
+) -> dict[str, QualifiedName]:
+    outputs: dict[str, QualifiedName] = {}
+    for position, physical_name in enumerate(discover_adios_variables(path)):
         definition = canonical_definition(physical_name)
         units = units_for_definition(definition)
         coordinate_system = coordinate_system_for_definition(definition)
         reference = manager.add_variable(
-            run=run,
             dataset=dataset,
             variable=physical_name,
             definition=definition,
@@ -278,13 +267,16 @@ def _register_source_variables(
             physical_name,
             LogicalProduct(reference, definition, units, coordinate_system),
         )
+        outputs[f"variable_{position}"] = reference
+    if not outputs:
+        raise ValueError(f"Simulation dataset contains no variables: {dataset}")
+    return outputs
 
 
 def _register_derived_variables(
     manager: Manager,
     index: ProvenanceIndex,
     run_name: str,
-    run: QualifiedName,
     dataset: str,
     path: Path,
     agent: QualifiedName,
@@ -300,20 +292,18 @@ def _register_derived_variables(
             role: index.by_definition[(run_name, definition)].reference
             for role, definition in spec["inputs"].items()
         }
-        result = manager.add_activity(
+        output = manager.add_variable(
+            dataset=dataset,
+            variable=physical_name,
+            definition=str(spec["definition"]),
+            units=str(spec["units"]),
+            coordinate_system="Cartesian",
+        )
+        manager.add_activity(
             "quantity_of_interest",
             inputs=inputs,
-            outputs={
-                "result": VariableSpec(
-                    run=run,
-                    dataset=dataset,
-                    variable=physical_name,
-                    definition=str(spec["definition"]),
-                    units=str(spec["units"]),
-                    coordinate_system="Cartesian",
-                )
-            },
-            action_spec={
+            outputs={"result": output},
+            metadata={
                 "operation": spec["operation"],
                 "discretization": "numpy.gradient with unit grid spacing",
                 "script_dataset": plan_location,
@@ -326,7 +316,7 @@ def _register_derived_variables(
             dataset,
             physical_name,
             LogicalProduct(
-                result.outputs["result"],
+                output,
                 str(spec["definition"]),
                 str(spec["units"]),
                 "Cartesian",
@@ -338,7 +328,6 @@ def _register_statistics(
     manager: Manager,
     index: ProvenanceIndex,
     run_name: str,
-    run: QualifiedName,
     stats_dataset: str,
     stats_path: Path,
     agent: QualifiedName,
@@ -363,8 +352,7 @@ def _register_statistics(
             )
 
         outputs = {
-            statistic: VariableSpec(
-                run=run,
+            statistic: manager.add_variable(
                 dataset=stats_dataset,
                 variable=output_name,
                 definition=f"{source.definition}_{statistic}",
@@ -372,11 +360,11 @@ def _register_statistics(
             )
             for statistic, output_name in sorted(outputs_by_statistic.items())
         }
-        result = manager.add_activity(
+        manager.add_activity(
             "quantity_of_interest",
             inputs={"source": source.reference},
             outputs=outputs,
-            action_spec={
+            metadata={
                 "operation": "descriptive_statistics",
                 "statistics": sorted(outputs),
                 "scope": "all elements per output timestep",
@@ -385,14 +373,19 @@ def _register_statistics(
             agent=agent,
             plan=plan,
         )
-        for statistic, reference in result.outputs.items():
+        for statistic, reference in outputs.items():
             output_name = outputs_by_statistic[statistic]
-            output_spec = outputs[statistic]
+            definition = f"{source.definition}_{statistic}"
             index.add(
                 run_name,
                 stats_dataset,
                 output_name,
-                LogicalProduct(reference, output_spec.definition, output_spec.units, None),
+                LogicalProduct(
+                    reference,
+                    definition,
+                    _stat_units(source.units, statistic),
+                    None,
+                ),
             )
 
 
@@ -432,9 +425,14 @@ def record_campaign_provenance(
             f"{run_name} simulation configuration",
             location=plan_location,
         )
-        run = manager.add_run(run_name, plan=run_plan, agent=solver)
-        index.runs[run_name] = run
-        _register_source_variables(manager, index, run_name, run, name, path)
+        source_outputs = _register_source_variables(manager, index, run_name, name, path)
+        index.simulations[run_name] = manager.add_activity(
+            "simulation",
+            name=run_name,
+            outputs=source_outputs,
+            agent=solver,
+            plan=run_plan,
+        ).activity
 
     derived_paths = {
         name: path for name, path in dataset_paths.items() if Path(name).name == "analysis.bp"
@@ -452,9 +450,10 @@ def record_campaign_provenance(
         script = Path(__file__).with_name("adios_derived_variables.py")
         # The script is one reusable Plan. Run-specific parameters belong on
         # the simulation Plans and operation-specific values belong in each
-        # Activity's action specification; duplicating the script per run
+        # Activity metadata; duplicating the script per run
         # would add metadata without changing its identity or meaning.
-        plan_location = _store_plan_source(manager, script, "plans/adios_derived_variables.py")
+        # Root-level metadata must not introduce another schema run scope.
+        plan_location = _store_plan_source(manager, script, "__provenance_plan_adios_derived_variables.py")
         plan = manager.add_plan("MHD derived-variable calculation", location=plan_location)
         for name, path in sorted(derived_paths.items()):
             run_name = run_name_from_dataset(name, resolved_root)
@@ -462,7 +461,6 @@ def record_campaign_provenance(
                 manager,
                 index,
                 run_name,
-                index.runs[run_name],
                 name,
                 path,
                 analysis_agent,
@@ -473,7 +471,7 @@ def record_campaign_provenance(
     if stats_paths:
         assert analysis_agent is not None
         script = Path(__file__).with_name("adios_stats.py")
-        plan_location = _store_plan_source(manager, script, "plans/adios_stats.py")
+        plan_location = _store_plan_source(manager, script, "__provenance_plan_adios_stats.py")
         plan = manager.add_plan("MHD descriptive-statistics calculation", location=plan_location)
         for name, path in sorted(stats_paths.items()):
             run_name = run_name_from_dataset(name, resolved_root)
@@ -481,7 +479,6 @@ def record_campaign_provenance(
                 manager,
                 index,
                 run_name,
-                index.runs[run_name],
                 name,
                 path,
                 analysis_agent,
@@ -552,49 +549,6 @@ def _input_records(
     return inputs
 
 
-def _record_definition(record: ProvEntity) -> str:
-    """Return the single scientific definition on a logical variable."""
-    definitions = record.get_attribute(HPC["variableDefinition"])
-    if len(definitions) != 1:
-        raise ValueError(f"Logical variable has {len(definitions)} definitions: {record.identifier}")
-    return str(next(iter(definitions)))
-
-
-def _visualization_definition(records: dict[str, ProvEntity], vis_type: str) -> str:
-    """Choose a scientific identity for a generated image sequence.
-
-    A scalar-field view inherits the primary variable's definition. A
-    streamline view is about the vector field, not the optional scalar field
-    used only as its color background, so matching component suffixes are
-    collapsed (for example, magnetic_field_x/y -> magnetic_field).
-    """
-    primary = records.get("primary")
-    if primary is not None:
-        return f"{_token(_record_definition(primary))}_visualization"
-
-    component_definitions = [
-        _record_definition(record)
-        for role, record in sorted(records.items())
-        if role.startswith("streamline_")
-    ]
-    if component_definitions:
-        bases = {re.sub(r"_[xyz]$", "", definition) for definition in component_definitions}
-        if len(bases) == 1:
-            return f"{_token(next(iter(bases)))}_visualization"
-
-    # Manager.visualization uses role-specific arguments rather than a generic
-    # "primary" role for most scalar plots. Prefer the field carrying the
-    # picture's values before falling back to the presentation kind.
-    for role in ("color", "contour", "y_axis_0"):
-        record = records.get(role)
-        if record is not None:
-            return f"{_token(_record_definition(record))}_visualization"
-
-    # This fallback remains meaningful for future multi-input visualization
-    # kinds whose inputs do not share a conventional component name.
-    return f"{_token(vis_type)}_visualization"
-
-
 class VisualizationProvenanceRecorder:
     """Append visualization Activities after image sequences are registered."""
 
@@ -615,7 +569,7 @@ class VisualizationProvenanceRecorder:
         location = _store_plan_source(
             self.manager,
             self.script_path,
-            f"plans/{self.script_path.name}",
+            f"__provenance_plan_{self.script_path.name}",
         )
         plan = self.manager.add_plan("MHD visualization script", location=location)
         self.plan = (plan, location)
@@ -631,21 +585,12 @@ class VisualizationProvenanceRecorder:
         steps: list[int],
         rendering_parameters: dict[str, Any],
         output_variable: str = "image_sequence",
-    ) -> QualifiedName:
-        """Record one sequence as a single time-varying logical data product."""
+    ) -> Any:
+        """Record one media collection or the datasets in a scalar-field sequence."""
         document = active_document(self.manager)
         records = _input_records(document, source_dataset, semantic_kwargs)
-        input_runs = {
-            next(iter(record.get_attribute(HPC["run"])))
-            for record in records.values()
-        }
-        if len(input_runs) != 1:
-            raise ValueError("A visualization activity must use logical variables from one run")
-        run = next(iter(input_runs))
-        run_name = Path(source_dataset).parent.as_posix()
-        if run_name == ".":
-            run_name = "root"
 
+        activity_id = uuid.uuid4()
         info = self.manager.info(list_replicas=False, list_files=False)
         sequence = next(
             (item for item in info.visualization_sequences.values() if item.name == sequence_name),
@@ -654,50 +599,56 @@ class VisualizationProvenanceRecorder:
         if sequence is None:
             raise LookupError(f"Visualization sequence was not registered: {sequence_name}")
 
-        activity_id = uuid.uuid4()
-        manifest_name = (
-            f"{run_name}/provenance/visualizations/"
-            f"{_token(Path(sequence_name).name)}_{activity_id.hex}.json"
-        )
-        manifest = {
-            "sequence_name": sequence.name,
-            "visualization_type": sequence.vis_type,
-            "thumbnail_dataset": sequence.thumbnail_dataset_name,
-            "items": [
+        item_types = {item.item_type for item in sequence.items}
+        if item_types <= {"IMAGE", "VIDEO"}:
+            sequence_entity = self.manager.add_visualization_sequence_entity(sequence_name)
+            outputs = {output_variable: sequence_entity}
+            sequence_items = [
                 {
                     "order": item.item_order,
-                    "type": item.item_type,
                     "dataset": item.dataset_name,
-                    "uuid": item.item_uuid,
+                    "item_type": item.item_type,
                 }
                 for item in sequence.items
-            ],
-        }
-        _store_json(self.manager, manifest_name, manifest)
+            ]
+        else:
+            if len(sequence.items) != len(steps):
+                raise ValueError(
+                    f"Visualization sequence has {len(sequence.items)} items but {len(steps)} time steps: "
+                    f"{sequence_name}"
+                )
+            outputs = {}
+            sequence_items = []
+            for position, item in enumerate(sequence.items):
+                role = f"frame_{item.item_order}"
+                outputs[role] = self.manager.add_dataset_entity(item.dataset_name)
+                sequence_items.append(
+                    {
+                        "role": role,
+                        "order": item.item_order,
+                        "dataset": item.dataset_name,
+                        "step": int(steps[position]),
+                    }
+                )
+            if not outputs:
+                raise ValueError(f"Visualization sequence has no items: {sequence_name}")
 
         plan, plan_location = self._plan()
-        definition = _visualization_definition(records, vis_type)
         result = self.manager.add_activity(
             "visualization",
             inputs={role: record.identifier for role, record in records.items()},
-            outputs={
-                output_variable: VariableSpec(
-                    run=run,
-                    dataset=manifest_name,
-                    variable=output_variable,
-                    definition=definition,
-                )
-            },
-            action_spec={
+            outputs=outputs,
+            metadata={
                 "visualization_type": vis_type,
                 "steps": [int(step) for step in steps],
                 "semantic_variables": semantic_kwargs,
                 "rendering_parameters": rendering_parameters,
-                "sequence_manifest": manifest_name,
+                "sequence_name": sequence_name,
+                "sequence_items": sequence_items,
                 "script_dataset": plan_location,
             },
             agent=self.agent,
             plan=plan,
             activity_id=activity_id,
         )
-        return result.outputs[output_variable]
+        return result

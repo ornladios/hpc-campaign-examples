@@ -1,54 +1,77 @@
 # Provenance in the Orszag-Tang example
 
-This branch demonstrates how the restricted campaign authoring API from
-`hpc-campaign` PR #102 records scientific lineage directly as W3C PROV. The
-campaign does not replace the metadata already present in ADIOS. Instead, it
-adds stable scientific identities and relationships across files, runs, and
-processing steps.
+The examples use the Entity-first provenance API from the `provenance-api-redo`
+branch of `hpc-campaign`. It records scientific identity and lineage alongside
+the campaign data. ADIOS remains authoritative for physical variable names,
+array shapes, types, and timesteps.
 
 ## Metadata responsibilities
-
-Three complementary layers are used:
 
 | Layer | Records |
 |---|---|
 | ADIOS | Physical variable names, types, array shapes, and timesteps |
-| Campaign layout schema | The required `output.bp` organization for every run |
-| W3C PROV | Scientific identity, generation, derivation, responsibility, and processing Plans |
+| Campaign layout schema | Required `output.bp` organization for every run |
+| W3C PROV | Product identity, generation, derivation, responsibility, and processing Plans |
 
 The campaign embeds its layout schema and the small scripts or parameter files
-referenced by PROV Plans. A tool can therefore discover both the data layout
-and the instructions used to produce derived products without requiring the
-campaign schema to understand every ADIOS attribute.
+referenced by PROV Plans. A tool can discover the data layout and the
+instructions used to produce derived products without requiring the campaign
+schema to understand every ADIOS attribute.
 
-## Mapping to PROV
+Shared scripts use root-level dataset names such as
+`__provenance_plan_adios_stats.py`. A separate top-level `plans/` directory
+would be interpreted as another run by the run-relative schema. Run-specific
+configuration files remain under their owning run's `plans/` directory.
+The ingest script validates the schema after recording provenance, and
+`make verify` checks it again after visualization registration.
 
-| Campaign concept | W3C PROV representation |
-|---|---|
-| Simulation run | `prov:Activity` typed as `hpc:SimulationRun` |
-| Logical variable | `prov:Entity` typed as `hpc:LogicalVariable` |
-| Registered dataset | `prov:Entity` typed as `hpc:Dataset` |
-| Reduction, projection, QoI, or visualization | A typed `prov:Activity` |
-| Physical input or generated output | Qualified `prov:Usage` or `prov:Generation` with a role |
-| Exact output-to-input lineage | Qualified `prov:Derivation` referencing its Generation and Usage |
-| Software or person | `prov:Agent` |
-| Script or run configuration | `prov:Plan` |
-| Operation parameters | An optional, canonical JSON ActionSpecification Plan |
+## API model
 
-The API intentionally supports the campaign subset needed by this example; it
-does not attempt to expose every possible PROV construct. The stored document
-is nevertheless standard PROV and can be exported as PROV-JSON.
+`Manager.add_variable()` declares a logical-variable Entity backed by a
+registered dataset. It describes a physical variable and its stable scientific
+definition, units, and coordinate system. It does not imply how or by whom the
+variable was produced.
 
-## Worked pipeline
+`Manager.add_activity()` records that production explicitly. Inputs and outputs
+are references to product Entities that already exist. For example:
 
-For a run whose solver writes names such as `sim_pressure`, `sim_bx`, and
-`sim_by`, the example records the following graph:
+```python
+pressure = manager.add_variable(
+    dataset="run-001/output.bp",
+    variable="sim_pressure",
+    definition="pressure",
+    units="normalized pressure",
+)
+simulation = manager.add_activity(
+    "simulation",
+    name="run-001",
+    outputs={"pressure": pressure},
+    agent=solver,
+    plan=configuration,
+)
+```
+
+A simulation is a root Activity with no inputs. It generates the declared
+logical variables through its outputs. There is no separate simulation-run
+record or implicit generation in `add_variable()`.
+
+For derived products, first declare each output with `add_variable()`, then pass
+the input and output Entity references to `add_activity()`. By default, each
+output is derived from every input. `derivations=` can specify different
+input-to-output relationships. Activity `metadata=` stores JSON-compatible
+method details such as operation names, parameters, and requested statistics.
+Software and people are Agents; scripts and run configurations are Plans.
+
+## Products and lineage in this example
+
+For a run with physical names such as `sim_pressure`, `sim_bx`, and `sim_by`,
+the example records this graph:
 
 ```text
-SimulationRun: run-001
-  generates pressure                 [Entity; definition=pressure]
-  generates sim_bx                   [Entity; definition=magnetic_field_x]
-  generates sim_by                   [Entity; definition=magnetic_field_y]
+Simulation: run-001
+  generates pressure                 [LogicalVariable]
+  generates sim_bx                   [LogicalVariable]
+  generates sim_by                   [LogicalVariable]
 
 pressure
   -> QuantityOfInterest: gradient_magnitude
@@ -64,55 +87,74 @@ pressure
 
 magnetic_field_x + magnetic_field_y + pressure
   -> Visualization: magnetic streamlines colored by pressure
-  -> magnetic-field visualization sequence
+  -> image-sequence collection
 ```
 
 `sim_pressure` and an unprefixed `pressure` in another run share the scientific
-definition `pressure` while remaining separate logical-variable Entities.
-That distinction permits cross-run queries without conflating concrete data
-products.
+definition `pressure` while remaining separate logical-variable Entities. That
+distinction supports cross-run queries without conflating concrete products.
 
-The `div(B)` Activity has two independently role-qualified inputs,
-`magnetic_x` and `magnetic_y`. Statistics are not metadata attached to the
-source variable: every statistic is an output logical variable generated by a
-QoI Activity and derived from its exact source.
+The `div(B)` Activity has two role-qualified inputs, `magnetic_x` and
+`magnetic_y`. Statistics are output logical variables generated by a QoI
+Activity and derived from their exact source variable.
 
-## Plans, agents, and action specifications
+## Images, videos, and sequences
 
-The simulation run is associated with the `ot_mhd` software Agent and its
+`Manager.add_dataset_entity(name)` registers an existing media dataset as a
+typed Entity, such as `Image` or `Video`. A visualization sequence is a
+separate collection product: `Manager.add_visualization_sequence_entity(name)`
+registers a snapshot of its ordered image or video members. The Visualization
+Activity generates this collection Entity and derives it from the logical
+variables used to render it. Media datasets do not need logical-variable
+wrappers.
+
+Each render writes new media products under
+`<sequence-name>/revisions/<uuid>/`. With `--replace`, the visible sequence
+name stays the same while its current members change. New members produce a
+new collection snapshot and get a new producing Activity. Earlier media and
+their producer links remain available, including when a rerender uses the
+same settings. Scalar-field rerenders likewise use new per-frame dataset
+identities. Standalone MP4s and external PNGs also use revision paths, so
+rerendering does not overwrite files referenced by earlier provenance.
+
+The movie example stores frame time associations on each video item using the
+same physical-time metadata model as image sequences. It can use
+`time_range=(t_min, t_max)`, `time_variable=(dataset, variable)` with
+`time_indices=[...]`, or explicit `frame_times=[...]`. In indexed mode, each
+movie frame inherits the selected physical time value from the source
+variable. Viewer behavior outside the sequence's time range is left to the
+viewer.
+
+Raw scalar-field sequences are represented by their registered per-frame
+dataset Entities as Activity outputs. Their Activity metadata records the
+sequence name, ordering, and associated steps. This uses dataset products
+because the campaign collection API currently supports image and video
+sequences.
+
+## Plans, Agents, and Activity metadata
+
+Simulation Activities are associated with the `ot_mhd` software Agent and a
 run-specific `input_parameters.txt` Plan. Derived calculations and statistics
-are associated with NumPy and shared script Plans. Visualization Activities are
-associated with Matplotlib and one shared rendering-script Plan.
+are associated with NumPy and shared script Plans. Visualization Activities
+are associated with Matplotlib and the rendering script Plan. Reusable scripts
+are stored once and shared across runs.
 
-Each processing Activity also has a compact ActionSpecification. Examples
-include the operation name, statistics requested, rendering parameters, and a
-campaign-local reference to the script. Reusable scripts are stored once and
-shared across runs to avoid duplicating provenance metadata.
-
-## Time-varying products and images
-
-A time-varying ADIOS variable is one logical-variable Entity. This first
-version does not create an Entity for every timestep. ADIOS remains responsible
-for describing and reading the available steps.
-
-Likewise, one rendered image sequence is represented as one logical variable.
-Its backing campaign dataset is an embedded JSON manifest containing the
-sequence name, thumbnail, and ordered image item identities. The Visualization
-Activity records the selected steps and rendering parameters in its action
-specification and derives the sequence from every logical variable used by the
-rendering operation.
+Operation details are stored in `metadata=` on each Activity. The API has no
+`VariableSpec`, `add_run()`, or `action_spec=` argument: declare products with
+`add_variable()` or a dataset/sequence Entity registration call, then pass
+those Entity references to `add_activity()`.
 
 ## Units and coordinate systems
 
-Units and coordinate systems are deliberately simple strings. The example uses
-labels such as `normalized pressure`, `normalized velocity`, and `Cartesian`.
-It does not attempt unit conversion or define a universal units ontology.
-Statistics preserve their source unit except variance, whose string is written
-as the squared source unit.
+Units and coordinate systems are descriptive strings. The example uses labels
+such as `normalized pressure`, `normalized velocity`, and `Cartesian`. It does
+not perform unit conversion or define a universal units ontology. Statistics
+preserve their source unit except variance, whose string is written as the
+squared source unit.
 
 ## Running and exporting the example
 
-After generating an ensemble, create the campaign and its complete scientific
+After generating an ensemble, create the campaign and record its scientific
 provenance graph:
 
 ```bash
@@ -125,7 +167,7 @@ python scripts/add_adios_files_to_campaign.py \
   --exportProv ./mhd.prov.json
 ```
 
-Add pressure image sequences and append their Visualization Activities:
+Add pressure image sequences and their Visualization Activities:
 
 ```bash
 python scripts/render_adios_visualizations_to_campaign.py \
@@ -137,18 +179,17 @@ python scripts/render_adios_visualizations_to_campaign.py \
   --exportProv ./mhd-with-visualizations.prov.json
 ```
 
-The ACA contains the authoritative active PROV document. The exported JSON is
-for inspection, interchange, and use with other PROV tooling.
+The ACA contains the active PROV document. The exported JSON is for inspection,
+interchange, and other PROV tooling.
 
-## Intentional first-version boundaries
+## Boundaries
 
 - Workflows are reconstructed by tracing Activity inputs and outputs; there is
-  no separate named workflow execution object yet.
-- A growing time series remains one Entity; timestep revisions are not modeled.
+  no separate workflow-execution object.
+- A growing time series remains one logical-variable Entity; timesteps are not
+  separate provenance records.
 - Units and coordinate systems are descriptive strings only.
 - The example recognizes its default primary and derived BP names,
   `output.bp` and `analysis.bp`.
-- The example records the MHD schema and executable Plans, but it does not yet
-  register additional schema descriptors such as Fides models.
 - Provenance editing, withdrawal, collaboration sessions, annotations, and AI
   audit records are outside this scientific-provenance example.

@@ -377,10 +377,10 @@ def main() -> int:
     try:
         count = add_datasets(manager, datasets, out_root, args.dryRun)
         if manager is not None:
-            apply_and_validate_schema(manager, args.schema)
             provenance = record_campaign_provenance(manager, datasets, out_root)
+            apply_and_validate_schema(manager, args.schema)
             print(
-                f"[ok] provenance recorded for {len(provenance.runs)} run(s) and "
+                f"[ok] provenance recorded for {len(provenance.simulations)} simulation(s) and "
                 f"{len(provenance.by_physical)} logical variable(s)"
             )
             if args.exportProv is not None:

@@ -6,11 +6,10 @@ a 2D uniform-grid ideal-MHD Orszag-Tang vortex simulation with ADIOS2 output,
 ensemble execution, derived analysis, statistics, campaign ingestion, schema
 validation, and visualization.
 
-The `main` branch uses only APIs available on the current `hpc-campaign`
-`master` branch. This `provenance-pr-102` branch demonstrates the W3C PROV API
-proposed by
-[hpc-campaign PR #102](https://github.com/dpugmire/hpc-campaign/pull/102).
-See [PROVENANCE.md](PROVENANCE.md) for the complete data-to-PROV mapping.
+This branch uses the Entity-first W3C PROV API from the `provenance-api-redo`
+branch of `hpc-campaign`. Logical variables and media sequences are declared
+as products, then Activities explicitly record their generation and lineage.
+See [PROVENANCE.md](PROVENANCE.md) for the data-to-PROV mapping.
 
 ## TLDR
 
@@ -81,7 +80,8 @@ random 2D variable named `var` in each file. It also renders `file1.bp:var`
 to `file1_var_heatmap.png` and `file2.bp:var` to `file2_var_heatmap.png`, then
 registers both images as heatmap visualizations. W3C PROV records that `sim1`
 creates `file1.bp:var`, `sim2` creates `file2.bp:var`, and each visualization
-Activity derives its image from the matching `var`. The script writes
+Activity generates an image-sequence collection derived from the matching
+`var`. The script writes
 `toy_campaign.aca` and `toy_campaign.prov.json` under the output root.
 
 The example refuses to overwrite existing generated outputs. Use a fresh
@@ -94,12 +94,12 @@ The example refuses to overwrite existing generated outputs. Use a fresh
 - A C++17 compiler
 - ADIOS2 with C++ bindings
 - FFmpeg with the `libx264` encoder, for the movie target
-- An `hpc-campaign` version with the provenance API used by these examples, and
-  `Manager.video()` for the movie target
+- The `hpc-campaign` `provenance-api-redo` branch, which provides the
+  Entity-first provenance API and `Manager.video()` for the movie target
 - MPI, unless the solver is configured with `OT_ENABLE_MPI=OFF`
 
-The Python project installs `hpc-campaign` from its `master` branch along with
-Matplotlib, which the rendering script uses:
+The Python project installs `hpc-campaign` from its `provenance-api-redo` branch
+along with Matplotlib, which the rendering script uses:
 
 ```bash
 python3 -m venv .venv
@@ -108,11 +108,8 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
 
-As of October 15, 2026, `master` does not provide `VariableSpec` or
-`Manager.video()`, both of which these provenance and movie examples use. A
-clean install from the pinned branch is therefore not yet sufficient to run
-them. Install a checkout containing those APIs after this project so its
-editable package takes precedence:
+For local development against a campaign checkout, install that checkout after
+this project so its editable package takes precedence:
 
 ```bash
 python -m pip install -e /path/to/hpc-campaign
@@ -142,7 +139,7 @@ make movies          # add one pressure MP4 per output.bp dataset and keep a loc
 make streamlines     # add velocity and magnetic streamline image sequences
 make scalar-fields   # add raw SCALAR_FIELD visualization sequences
 make visualizations  # run movies, heatmaps, streamlines, and scalar-fields
-make verify          # print the ACA info table
+make verify          # validate schema and stored provenance, then print ACA info
 make all             # run runs, create, visualizations, and verify
 ```
 
@@ -150,9 +147,11 @@ make all             # run runs, create, visualizations, and verify
 rebuilds campaign registration, derived datasets, and statistics from
 `RUN_ROOT`. The visualization targets pass `--replace`; they replace matching
 visualization sequences by name, but they do not delete unrelated old
-sequences that are no longer selected by the Makefile variables. Movie files
-remain on disk under `MOVIE_OUTPUT_DIR`, mirroring their campaign sequence
-paths, as well as being embedded in the ACA.
+sequences that are no longer selected by the Makefile variables. Each render
+writes new products under `<sequence-name>/revisions/<uuid>/`, preserving
+earlier payloads, collection snapshots, and producer links. Movie files remain
+on disk under `MOVIE_OUTPUT_DIR` in these revision paths, as well as being
+embedded in the ACA. External PNG outputs use revision paths too.
 
 Useful Make variables:
 
@@ -171,7 +170,7 @@ make scalar-fields SCALAR_FIELD_DTYPE=
 Defaults:
 
 - `RUN_ROOT=$(CURDIR)/runs`
-- `MOVIE_OUTPUT_DIR=$(RUN_ROOT)/movies`; MP4s are kept here in paths mirroring their campaign sequence names
+- `MOVIE_OUTPUT_DIR=$(RUN_ROOT)/movies`; MP4s are kept under each sequence's `revisions/<uuid>/movie.mp4` path
 - `ARCHIVE=/Users/dpn/ORNL_Dropbox/campaign-store/mhd_orszag_tang_runs_full.aca`
 - `PRIMARY_VARS=pressure,rho,speed,current_z`
 - `DERIVED_VARS=div_b,grad_pressure_abs,grad_rho_abs`
@@ -255,15 +254,20 @@ python scripts/add_adios_files_to_campaign.py \
   --showInfo
 ```
 
-The ingest script embeds `schemas/mhd_orszag_tang.yaml` and immediately calls
-`Manager.validate_schema()`. The schema describes an append-mode `output.bp`
+The ingest script embeds `schemas/mhd_orszag_tang.yaml` and calls
+`Manager.validate_schema()` after recording provenance and its Plan datasets.
+The schema describes an append-mode `output.bp`
 inside each run directory and declares `time` as the physical time variable.
 ADIOS remains the authoritative description of variables inside the file.
 
 Schema validation is metadata-only. Additional analysis, statistics, images,
-and text datasets are allowed in each run. After validating the layout, the
-script authors the campaign's W3C PROV document: simulation runs, logical
+and text datasets are allowed in each run. The script authors the campaign's
+W3C PROV document: Simulation Activities, logical
 variables, software agents, Plans, and exact generation/derivation relations.
+Shared script Plans are embedded once as root-level metadata datasets named
+`__provenance_plan_<script-name>`. They do not create an additional run scope.
+`make verify` checks the schema again after all visualizations are added and
+loads the active provenance document to verify its stored hash.
 
 To write a reviewable PROV-JSON copy beside the campaign, add:
 
@@ -394,11 +398,13 @@ make visualizations
 
 The rendering script uses `Manager.visualization()` to register explicit image
 items, source variables, semantic roles, a thumbnail, and rendering metadata.
-It also records one Visualization Activity per sequence. The output logical
-variable points to an embedded sequence manifest, and qualified PROV
+It also records one Visualization Activity per sequence. Image and video
+outputs are typed collection Entities containing their ordered media members,
+and qualified PROV
 derivations identify every field used for geometry, color, or contours. The
-scalar-field script follows the same pattern, but sequence items are
-`SCALAR_FIELD` datasets rather than PNG images.
+scalar-field script records each `SCALAR_FIELD` dataset as an Activity output,
+with sequence ordering and steps in Activity metadata. Media products do not
+need logical-variable wrappers.
 
 ## Run the tests
 
@@ -407,7 +413,12 @@ python -m pytest -q
 python -m ruff check .
 ```
 
-The tests validate the schema against a two-run campaign and exercise the
+The tests validate the schema after provenance and media registration and exercise the
 scientific-name resolution, multiple-input derived calculation, statistics,
 simulation generation, exact derivation parents, and visualization provenance.
+They also check relative and absolute build paths and the final verification
+command's handling of valid archives, missing provenance, and invalid layouts.
+Command-line rerender tests cover identical and changed image, external PNG,
+movie, and scalar-field outputs, checking that earlier media and producer
+links remain intact. Missing `--replace` is rejected before registration.
 Generated campaigns and simulation products are ignored by Git.

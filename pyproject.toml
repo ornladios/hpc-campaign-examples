@@ -9,7 +9,7 @@ description = "End-to-end examples for HPC Campaign"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "hpc-campaign @ git+https://github.com/dpugmire/hpc-campaign.git@master",
+    "hpc-campaign @ git+https://github.com/dpugmire/hpc-campaign.git@provenance-api-redo",
     "matplotlib>=3.8",
 ]
 

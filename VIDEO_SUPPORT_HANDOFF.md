@@ -5,11 +5,11 @@ campaign API version it requires.
 
 ## Checkouts and branches
 
-- Campaign library: `/Users/dpn/proj/hpc_campaign/hpc-campaign`, current
-  checkout branch `provenance-api-redo`; the video API used for validation is
-  commit `7de6241` on `add_video`.
+- Campaign library: `/Users/dpn/proj/hpc_campaign/hpc-campaign`, branch
+  `provenance-api-redo` (PR #107, commit `620b91a`, including the first-call
+  atomicity fix).
 - Examples: `/Users/dpn/proj/hpc_campaign/hpc-campaign-examples`, branch
-  `add_videos`.
+  `provenance-api-redo`, based on the video example branch `add_videos`.
 
 The campaign checkout has unrelated pre-existing untracked files. Preserve
 them while continuing this work.
@@ -69,8 +69,10 @@ FFmpeg to encode an H.264 MP4. It registers a `VIDEO` item with
 `time_variable=(dataset.name, "time")` and the exact ADIOS timestep indices
 returned by the renderer. Movie mode requires one rendered frame per step.
 The current Makefile target uses pressure heatmaps, all steps, and 10 frames
-per second. MP4 copies remain under `RUN_ROOT/movies` by default, preserving
-the sequence path; override this with `MOVIE_OUTPUT_DIR`.
+per second. MP4 copies remain under `RUN_ROOT/movies` by default, under
+`<sequence-name>/revisions/<uuid>/movie.mp4`; override the output directory
+with `MOVIE_OUTPUT_DIR`. Each render uses a fresh revision, so replacing the
+visible sequence does not overwrite earlier files or reuse their producer.
 
 ```bash
 make movies
@@ -80,12 +82,16 @@ make movies
 `libx264` encoder is required. The renderer pads odd pixel dimensions so
 `yuv420p` encoding works with H.264.
 
-Movie registration also adds a PROV visualization Activity. The Activity
-links the source logical variables to an output named `video`; its rendering
-parameters include the timestep list, frame rate, and encoder. The sequence
-manifest records each item type, dataset name, UUID, and ordering. The
-provenance recorder defaults to the existing `image_sequence` output name for
-non-video visualizations, preserving their current behavior.
+Movie registration also adds a PROV Visualization Activity using the
+Entity-first API. The source logical variables are declared with
+`Manager.add_variable()` and passed as Activity inputs. The output is the
+collection Entity from `Manager.add_visualization_sequence_entity()`, which
+captures the ordered VIDEO dataset members. Rendering parameters, selected
+steps, and sequence name are stored in Activity `metadata=`; the rendering
+script is associated as a Plan. Image sequences use the same collection
+pattern. Raw scalar-field sequences instead generate their registered
+per-frame dataset Entities because the campaign collection API supports only
+image and video sequences.
 
 ### Video variable roles
 
@@ -133,34 +139,48 @@ These are runtime artifacts, not files tracked in the examples repository.
 
 ## Dependencies and validation
 
-The examples `pyproject.toml` pins the campaign dependency to `master`, as
-requested. As of October 15, 2026, remote `master` does not export
-`VariableSpec` or provide `Manager.video()`. The current provenance and movie
-examples therefore need a campaign checkout with both APIs installed after
-the examples package until the relevant campaign changes are merged. If the
-provenance API is present but `Manager.video()` is missing, the renderer exits
-with a direct movie API requirement message.
+The examples `pyproject.toml` pins the campaign dependency to the
+`provenance-api-redo` branch. That branch contains the Entity-first
+provenance API and `Manager.video()` used by the examples. For local development,
+installing a campaign checkout after this project makes the checkout's
+editable package take precedence.
 
-Validation performed during this work:
+Validation for the provenance API migration:
 
-- Ruff checks: passed for the whole examples repository.
-- Examples full test suite against campaign commit `7de6241`: `21 passed`,
-  including `test_example_helpers.py` and `test_mhd_provenance.py`.
-- Campaign video tests: `4 passed` (`tests/test_video.py`).
-- `make movies` against a disposable copy of the ACA completed and added three
-  videos with 35, 42, and 30 frames, plus per-video provenance records. MP4s
-  were retained under the temporary `MOVIE_OUTPUT_DIR` used for validation.
-- A disposable ACA smoke check registered an MP4 against a real example BP
-  dataset. The resulting `VIDEO` item had 35 per-frame physical times from
-  0.0 to 1.0 seconds.
-- The three videos in the current ACA were extracted, checksum-checked, and
-  inspected with `ffprobe`.
+- Ruff checks: passed for tracked example code and the new verification files.
+- Examples full test suite against the campaign checkout with the review fixes:
+  `31 passed, 4 subtests passed`. This covers simulation, derived products,
+  image/video collections, scalar-field outputs, video time metadata, final
+  schema validation, relative/absolute Makefile build paths, and repeated
+  image, external PNG, movie, and scalar-field rendering. Rerender tests verify
+  that earlier payloads and producer links are preserved.
+- A clean installation from the examples dependency declaration resolved
+  campaign commit `8628bc3`. The review fixes are additionally installed as a
+  local wheel in that disposable environment, and the tests and workflow run
+  without a local campaign checkout on `PYTHONPATH`.
+- A disposable full `make all` run uses all three solvers on 16x16 grids,
+  serial execution, and two stored timesteps. It produces 3 VIDEO sequences,
+  27 IMAGE sequences, and 21 SCALAR_FIELD sequences. All 72 visualization
+  outputs trace to a simulation, and `ffprobe` verifies each standalone MP4
+  has two H.264 frames matching the stored physical times `[0.0, 0.02]`.
+- Running `make visualizations verify` again on that archive succeeds. The
+  visible sequence count stays at 51, with 102 Visualization Activities
+  recording the two executions. All 99 earlier embedded media payloads and
+  618 Generation links are preserved, as are the first three standalone
+  movies. All six MP4 revisions pass `ffprobe`, and the 72 current output
+  Entities trace to the correct simulation.
+- This is a small compatibility check. The default 128x128 ensemble, MPI
+  execution, and interactive viewer playback were not rerun for this change.
+
+Shared script Plans are stored once as root-level
+`__provenance_plan_<script-name>` datasets. This prevents them from being
+interpreted as another simulation directory by the layout schema. Ingestion
+validates the schema after provenance registration; `make verify` validates
+the final layout and loads the active provenance document with its hash check.
 
 ## Suggested next checks
 
-1. Merge campaign video support to `master`, then verify a clean Poetry install
-   resolves `Manager.video()` from the pinned dependency.
-2. Inspect `hpc_campaign manager <archive> info` and movie playback in the
+1. Inspect `hpc_campaign manager <archive> info` and movie playback in the
    campaign viewer.
-3. Confirm behavior when time-variable replicas are remote or archived and no
+2. Confirm behavior when time-variable replicas are remote or archived and no
    local replica is available.
